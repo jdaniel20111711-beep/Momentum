@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Momentum · prototipo con rival que aprende</title>
+<style>
+:root{--bg:#e9eef3;--panel:#f8fafc;--tx:#17212c;--mut:#55657a;--ice:#f1f8fd;--grid:#cfe0ed;--edge:#c8372d;--p1:#1f5fe0;--p2:#e07a1f;--line:#cdd6e0;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0b1118;--panel:#141c26;--tx:#e4ebf3;--mut:#8d9cb0;--ice:#121d29;--grid:#1d2c3d;--edge:#ee6a5f;--p1:#6a9bff;--p2:#f4a45e;--line:#27354a}}
+:root[data-theme="dark"]{--bg:#0b1118;--panel:#141c26;--tx:#e4ebf3;--mut:#8d9cb0;--ice:#121d29;--grid:#1d2c3d;--edge:#ee6a5f;--p1:#6a9bff;--p2:#f4a45e;--line:#27354a}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--tx);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;display:flex;flex-direction:column;overflow:hidden}
+#wrap{position:relative;flex:1;min-height:0}
+canvas{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair}
+#hud{position:absolute;left:12px;top:10px;pointer-events:none;font-variant-numeric:tabular-nums}
+#hud b{font-size:20px}
+#hud span{color:var(--mut)}
+#help{position:absolute;right:12px;top:10px;max-width:260px;text-align:right;color:var(--mut);font-size:13px;pointer-events:none}
+details{background:var(--panel);border-top:1px solid var(--line);padding:8px 14px;max-height:45vh;overflow:auto}
+summary{cursor:pointer;font-weight:600}
+#ctl{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:8px 18px;margin-top:8px}
+label{display:flex;flex-direction:column;gap:2px;font-size:13px}
+label output{color:var(--mut);float:right}
+input[type=range]{width:100%}
+.row{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+button,select{font:inherit;padding:5px 12px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--tx);cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+button:focus-visible,input:focus-visible,summary:focus-visible,select:focus-visible{outline:2px solid var(--p1);outline-offset:2px}
+.mut{color:var(--mut);font-size:12px}
+</style>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c" aria-label="Pista de Momentum"></canvas>
+  <div id="hud"></div>
+  <div id="help"></div>
+</div>
+<details open>
+  <summary>Ajustes y rival</summary>
+  <div class="row" style="margin-top:8px">
+    <label style="flex-direction:row;gap:6px;align-items:center">Modo
+      <select id="modo"><option value="solo">Un jugador (vs IA)</option><option value="local">Local · 2 jugadores</option><option disabled>Online (próximamente)</option></select></label>
+    <button id="login">Entrar con Google</button><span id="fb" class="mut"></span>
+  </div>
+  <div id="brain" class="mut" style="margin-top:6px"></div>
+  <div id="ctl"></div>
+  <div class="row" style="margin-top:10px">
+    <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" id="lineal" checked> Carga lineal (sin tope)</label>
+    <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" id="bot" checked> Rival activo</label>
+    <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" id="ventaja" checked> Ventaja de la IA</label>
+    <button id="reset">Reiniciar discos</button>
+    <button id="olvidar">Borrar memoria del rival</button>
+  </div>
+</details>
+<script>
+/* ---------- Firebase: rellena con los datos de tu proyecto (Configuración > Tus apps > Web) ---------- */
+const FB={apiKey:'',authDomain:'',projectId:'',appId:''};
+
+const $=id=>document.getElementById(id);
+const cv=$('c'),ctx=cv.getContext('2d');
+const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
+const DT=1/60, R=28, W={w:2400,h:1400};
+const P={vBaja:250,vAlta:900,aire:0.6,carga:450,lineal:true,bot:true,ventaja:true};
+// Ventaja de la IA: puntería perfecta, recarga un 10% más rápida y micro-impulsos de frenado
+const IA={tiempo:0.9,microF:35,microDt:0.07,esqF:90,esqVmax:500,error:.3,reaccion:.3};   // tiempo: 0.9 = tarda un 10% menos · microF: px/s por micro-impulso · microDt: s entre micro-impulsos · esqF/esqVmax: impulso y velocidad lateral máxima al esquivar
+
+/* ---------- Estado ---------- */
+const mk=(x,y,col)=>({x,y,vx:0,vy:0,r:R,m:1,col,x0:x,y0:y,cam:{x,y,z:1}});
+const A=mk(-500,0,'p1'), B=mk(500,0,'p2'), D=[A,B];
+const score={a:0,b:0};
+const nuevoRd=()=>({hit:false,esq:false,t:0,tH:-1,tL:-1,minM:1e9,acts:{}});
+let msg='',msgT=0,modo='solo',rd=nuevoRd();
+const inp=[0,1].map(()=>({on:0,t:0,id:null,sx:0,sy:0,cx:0,cy:0}));
+const bot={st:'wait',t:2,c:0,dur:0,esqCd:0,evD:null,err:0,dg:0};   // err: error de percepción al estimar dónde parará · dg: segundos seguidos en peligro
+
+/* ---------- Cerebro del rival: genoma + aprendizaje online ---------- */
+// charge: s de carga media · noise: error de puntería (rad) · lead: anticipación al movimiento
+// safe: respeto al borde propio · wait: pausa entre disparos (s)
+// wA/wC/wE/wW: preferencia por atacar / centrarse (reposicionarse y frenar) / esquivar / esperar
+// react: segundos de carga del jugador a partir de los cuales la IA se aparta de su línea de tiro
+const GB={charge:[.2,2.5],noise:[0,.4],lead:[0,1],safe:[0,1],wait:[.4,2.5],wA:[.3,1.2],wC:[0,1],wE:[0,1],wW:[0,1],react:[.15,1.5]};
+const G0={charge:1,noise:.25,lead:0,safe:.3,wait:1.2,wA:.9,wC:.25,wE:.2,wW:.1,react:.6};
+const gc=(k,v)=>clamp(v,GB[k][0],GB[k][1]);
+const gauss=()=>Math.random()+Math.random()+Math.random()-1.5;
+const nuevo=()=>({v:2,best:{...G0},cand:{...G0},rounds:0,wins:0,losses:0,ref:0});
+const norm=d=>(d&&d.v===2)?{...nuevo(),...d,best:{...G0,...d.best},cand:{...G0,...d.cand}}:nuevo();   // memoria de versiones anteriores (muy defensiva) se descarta
+function mutar(b){const o={};for(const k in GB){const[a,z]=GB[k];o[k]=gc(k,b[k]+gauss()*.2*(z-a));}return o;}
+let mem=nuevo();
+try{mem=norm(JSON.parse(localStorage.getItem('momentum-rival')));}catch(e){}
+mem.cand=mutar(mem.best);
+
+// Recompensa de la ronda: gana +1 (hasta +2.5 según lo cerca que estuvo de salirse), pierde -1, se sale solo -2
+const ACT={atk:'wA',ctr:'wC',esq:'wE',esp:'wW'};
+function aprender(jugFuera,botFuera){
+  const self=rd.tL>=rd.tH;                      // su último disparo fue posterior al último choque: se salió él solo
+  const near=clamp(1-rd.minM/400,0,1);          // 0 = siempre cómodo, 1 = rozó el borde
+  let r=0;
+  if(botFuera) r=jugFuera?-1:(self?-2:-1);
+  else if(jugFuera) r=1+1.5*near;
+  mem.rounds++; if(r>0)mem.wins++; if(r<0)mem.losses++;
+  const tot=Object.values(rd.acts).reduce((x,y)=>x+y,0)||1;
+  const refuerzo=g=>{for(const a in rd.acts){const k=ACT[a];g[k]=gc(k,g[k]+.12*r*rd.acts[a]/tot);}};
+  refuerzo(mem.cand);                           // las acciones usadas suben o bajan según la recompensa
+  if(r>mem.ref) mem.best=mem.cand; else refuerzo(mem.best);   // el candidato pasa a ser base si supera lo habitual
+  if(botFuera&&self){const b=mem.best;b.safe=gc('safe',b.safe+.1);b.charge=gc('charge',b.charge-.08);}
+  if(botFuera&&!jugFuera&&rd.hit&&!rd.esq){const b=mem.best;b.react=gc('react',b.react-.12);}   // la golpearon sin apartarse: reaccionará antes
+  mem.ref=.7*mem.ref+.3*r;
+  mem.cand=mutar(mem.best); guardar(); cerebro();
+}
+function cerebro(){
+  $('brain').textContent='Rival · rondas '+mem.rounds+' (gana '+mem.wins+' / pierde '+mem.losses+') · base: '+Object.entries(mem.best).map(([k,v])=>k+' '+v.toFixed(2)).join(' · ');
+}
+
+/* ---------- Guardado: localStorage + Firestore por cuenta de Google ---------- */
+let db=null,auth=null,user=null;
+const est=t=>{$('fb').textContent=t;};
+function guardar(){
+  try{localStorage.setItem('momentum-rival',JSON.stringify(mem));}catch(e){}
+  if(db&&user) db.collection('rivales').doc(user.uid).set({...mem,actualizado:firebase.firestore.FieldValue.serverTimestamp()}).then(()=>est('Guardado en tu cuenta'),()=>est('Error al guardar en la nube'));
+}
+function initFB(){
+  if(!FB.apiKey||!window.firebase){$('login').disabled=true;est('Firebase sin configurar: el rival aprende solo en este navegador');return;}
+  firebase.initializeApp(FB); auth=firebase.auth(); db=firebase.firestore();
+  auth.onAuthStateChanged(async u=>{
+    user=u; $('login').textContent=u?'Salir ('+(u.displayName||'cuenta')+')':'Entrar con Google';
+    if(!u){est('Sin sesión: memoria solo local');return;}
+    try{
+      const s=await db.collection('rivales').doc(u.uid).get();
+      if(s.exists){mem=norm(s.data());mem.cand=mutar(mem.best);cerebro();est('Memoria cargada de tu cuenta');}
+      else guardar();
+    }catch(e){est('No se pudo leer la nube');}
+  });
+  $('login').onclick=()=>user?auth.signOut():auth.signInWithPopup(new firebase.auth.GoogleAuthProvider()).catch(()=>est('Inicio de sesión cancelado'));
+}
+
+/* ---------- Física ---------- */
+const potencia=t=>P.lineal ? 120+P.carga*t : 120+P.carga*1.5*(1-Math.exp(-t/1.5));
+
+function lanzar(d,dx,dy,t){
+  const L=Math.hypot(dx,dy); if(L<6) return;
+  const p=potencia(t);
+  d.vx+=dx/L*p/d.m; d.vy+=dy/L*p/d.m;   // se suma al momentum que ya lleva
+}
+
+function colisionar(a,b){
+  const dx=b.x-a.x, dy=b.y-a.y, dist=Math.hypot(dx,dy), s=a.r+b.r;
+  if(dist>=s||dist===0) return;
+  const nx=dx/dist, ny=dy/dist, ov=s-dist, tm=a.m+b.m;
+  a.x-=nx*ov*b.m/tm; a.y-=ny*ov*b.m/tm;
+  b.x+=nx*ov*a.m/tm; b.y+=ny*ov*a.m/tm;
+  const vr=(b.vx-a.vx)*nx+(b.vy-a.vy)*ny;
+  if(vr>0) return;
+  if(-vr>60){rd.hit=true;rd.tH=rd.t;}
+  const t=clamp((-vr-P.vBaja)/(P.vAlta-P.vBaja),0,1);
+  const e=0.05+0.95*t;
+  const j=-(1+e)*vr/(1/a.m+1/b.m);
+  a.vx-=j/a.m*nx; a.vy-=j/a.m*ny;
+  b.vx+=j/b.m*nx; b.vy+=j/b.m*ny;
+}
+
+function reiniciar(){
+  for(const d of D){d.x=d.x0;d.y=d.y0;d.vx=d.vy=0;}
+  inp.forEach(p=>p.on=0); bot.st='wait'; bot.t=2; bot.esqCd=0; bot.evD=null; bot.dg=0; bot.err=0; micro.t=0; rd=nuevoRd();
+}
+function fuera(d){return Math.abs(d.x)>W.w/2+d.r||Math.abs(d.y)>W.h/2+d.r;}
+
+/* ---------- Detección del borde (usada por toda la IA) ---------- */
+// Margen que la IA exige respecto al borde. Siempre positivo: antes (R+(safe-.2)*400) con safe<.2 daba un margen negativo,
+// es decir, la IA consideraba "seguro" detenerse fuera de la pista.
+const margen=g=>R+20+g.safe*120;
+// ¿Está el punto (x,y) dentro de la zona segura (a distancia m del borde)?
+const dentro=(x,y,m)=>Math.abs(x)<W.w/2-m&&Math.abs(y)<W.h/2-m;
+// Dónde se detendría el disco B si no hiciera nada (la fricción es exponencial: x_final = x + v/aire)
+const paradaB=()=>[B.x+B.vx/P.aire*(1+bot.err),B.y+B.vy/P.aire*(1+bot.err)];   // con error de percepción: a veces se pasa de frenada
+// ¿Acabaría fuera de la zona segura sin hacer nada? (vale tanto si va a la deriva como tras un golpe o un rebote)
+const riesgo=g=>{const[fx,fy]=paradaB();return !dentro(fx,fy,margen(g));};
+const peligro=()=>bot.dg>IA.reaccion;           // solo reacciona tras un tiempo de reacción (no es instantáneo)
+// Segundos de carga necesarios para una potencia p (inversa de potencia())
+const durPara=p=>P.lineal?(p-120)/P.carga:-1.5*Math.log(Math.max(1-(p-120)/(P.carga*1.5),.02));
+
+/* ---------- IA ---------- */
+// Elige acción según su genoma y la situación: peligro de borde (favorece centrarse) y amenaza del jugador (favorece esquivar)
+function elegir(g){
+  if(peligro(g)) return 'ctr';                  // va a acabar fuera de la pista: lo primero es frenar
+  const m=Math.min(W.w/2-Math.abs(B.x),W.h/2-Math.abs(B.y)), pel=clamp(1-m/350,0,1);
+  const dx=B.x-A.x, dy=B.y-A.y, L=Math.hypot(dx,dy)||1, amen=clamp((A.vx*dx+A.vy*dy)/L/500,0,1);
+  const w={atk:g.wA*(1-.4*pel)+.01, ctr:g.wC*(.3+1.6*pel)+.01, esq:g.wE*amen*2+.01, esp:g.wW+.01};
+  let s=0; for(const k in w) s+=w[k];
+  let x=Math.random()*s; for(const k in w){x-=w[k]; if(x<=0) return k;}
+  return 'esp';
+}
+// Carga que necesita para frenar/centrarse ahora mismo (entre .15 y 2 s: con mucha velocidad no da tiempo)
+const durCentrar=()=>{const ix=-B.x*P.aire-B.vx, iy=-B.y*P.aire-B.vy, p=Math.hypot(ix,iy); return p<130?.15:clamp(durPara(p),.15,2);};
+function botLanzar(g){
+  const a=bot.act; if(a==='esp') return;      // esperar: dejar que la fricción trabaje
+  let ux,uy,dur=bot.dur;
+  const mg=margen(g);
+  // centrar: velocidad ideal para frenar en el centro, compensando la que ya lleva
+  const centrar=()=>{
+    const ix=-B.x*P.aire-B.vx, iy=-B.y*P.aire-B.vy, p=Math.hypot(ix,iy);
+    if(p<130) return false;
+    ux=ix/p; uy=iy/p; dur=durPara(p); return true;
+  };
+  const dx=A.x+A.vx*g.lead*.5-B.x, dy=A.y+A.vy*g.lead*.5-B.y, L=Math.hypot(dx,dy)||1;
+  if(a==='atk'){
+    const e=P.ventaja?0:(Math.random()-.5)*2*g.noise, c=Math.cos(e), s=Math.sin(e), nx=dx/L, ny=dy/L;   // con ventaja: siempre apunta justo al jugador
+    ux=nx*c-ny*s; uy=nx*s+ny*c;
+  }else if(a==='esq'){                        // esquivar: salto lateral respecto al jugador, hacia el lado del centro
+    const px=-dy/L, py=dx/L, sg=Math.sign(-px*B.x-py*B.y)||1; ux=px*sg; uy=py*sg;
+  }else if(!centrar()) return;
+  // antes de disparar, estima dónde se detendría y reduce la carga hasta que acabe dentro de la zona segura
+  const mgA=a==='atk'?R+g.safe*60:mg;         // al atacar acepta más riesgo
+  const seguro=d=>{const p=potencia(d),k=1+bot.err; let tx=(B.vx+ux*p)/P.aire*k, ty=(B.vy+uy*p)/P.aire*k;
+    if(a==='atk'){const T=Math.hypot(tx,ty), dc=L-2*R; if(T>dc&&T>0){const f=(dc+.3*(T-dc))/T; tx*=f; ty*=f;}}   // si llega al rival, el choque le quita casi todo el impulso
+    return dentro(B.x+tx,B.y+ty,mgA);};
+  dur=Math.max(dur,.05);
+  for(let i=0;i<9&&!seguro(dur);i++) dur=Math.max(dur*.8,.05);
+  if(!seguro(dur)){                           // ni con la carga mínima queda dentro (la potencia base ya es demasiado): no dispara ahí
+    if(a==='ctr'||!centrar()) return;         // en su lugar, intenta frenar hacia el centro; si no hay nada que corregir, no hace nada
+    dur=Math.max(dur,.05);
+  }
+  if(a!=='atk') dur=Math.min(dur,Math.max(bot.c,.05));   // no puede dar más impulso del que ha cargado (antes frenaba al instante)
+  rd.tL=rd.t; lanzar(B,ux*100,uy*100,dur);    // x100: lanzar() descarta vectores < 6 px
+}
+function botPaso(){
+  const g=mem.cand, vel=P.ventaja?1/IA.tiempo:1;   // con ventaja: espera y carga ~10% más rápidas
+  if(!P.bot){bot.st='wait';bot.t=2;return;}
+  bot.dg=riesgo(g)?bot.dg+DT:0;
+  if(bot.st==='wait'){
+    bot.t-=DT*vel;
+    if(peligro(g)) bot.t=Math.min(bot.t,.12);          // se va hacia el borde (deriva, golpe, rebote): no espera, reacciona ya
+    if(bot.t<=0){
+      bot.st='charge';bot.c=0;bot.err=gauss()*IA.error;bot.act=elegir(g);rd.acts[bot.act]=(rd.acts[bot.act]||0)+1;
+      bot.dur=bot.act==='atk'?g.charge*(.5+Math.random()):bot.act==='esq'?.2+Math.random()*.4:durCentrar();
+    }
+  }else{
+    bot.c+=DT*vel;
+    const pel=peligro(g);
+    if(pel&&bot.act!=='ctr'){bot.act='ctr';bot.dur=durCentrar();bot.c=0;}   // mientras cargaba otra acción empezó a irse fuera: cambia a frenar
+    if(bot.c>=bot.dur){botLanzar(g);bot.st='wait';bot.t=g.wait*(.6+.8*Math.random());}
+  }
+}
+
+// Reflejos de la IA: esquiva de último momento con UN solo impulso cargado (como cualquier otro disparo). Frenar en el borde ya no es un reflejo: es la acción "centrar", que exige cargar
+// La IA NO ve cómo cargas: solo reacciona cuando tu disco ya viene lanzado y el impacto está a punto de ocurrir. Puede llegar justa, tarde o no reaccionar.
+const micro={t:0};
+function botReflejos(){
+  if(!P.bot||!P.ventaja) return;
+  const g=mem.cand;
+  micro.t-=DT; bot.esqCd=Math.max(0,bot.esqCd-DT);
+  let amenaza=false;
+  const v=Math.hypot(A.vx,A.vy);
+  if(v>300){                                         // solo cuenta un disco ya lanzado y con fuerza
+    const ux=A.vx/v, uy=A.vy/v, rx=B.x-A.x, ry=B.y-A.y;
+    const along=rx*ux+ry*uy, cross=rx*uy-ry*ux, nx=uy, ny=-ux;   // along>0: la IA está en el camino · cross: distancia lateral a la trayectoria
+    const clear=2*R+44;
+    if(along>0&&Math.abs(cross)<clear){
+      amenaza=true;
+      if(!bot.evD) bot.evD={done:false,ok:Math.random()>.2,         // ok: 20% de las veces no reacciona a tiempo
+        tr:clamp(.5-.3*g.react,.12,.45)+Math.random()*.08};           // tr: a cuántos segundos del impacto reacciona (react bajo = antes)
+      const tArr=Math.max(along-2*R,0)/v;
+      if(!bot.evD.done&&bot.evD.ok&&bot.esqCd<=0&&tArr<=bot.evD.tr){
+        bot.evD.done=true;
+        const mg=margen(g), k=1-Math.exp(-P.aire*Math.max(tArr,.05));
+        const lado=sg=>{                                  // sg: +1/-1 lado de la trayectoria hacia el que se aparta
+          const vl=(B.vx*nx+B.vy*ny)*sg, desp=vl/P.aire*k;               // lo que ya se habría apartado con la velocidad que lleva
+          const falta=clear-cross*sg-desp; if(falta<=0) return null;      // ya se aparta sola
+          const dur=clamp(durPara(falta*P.aire/k),.1,.7), pw=potencia(dur);   // carga necesaria (limitada: puede quedarse corta)
+          const sx=B.x+(B.vx+nx*sg*pw)/P.aire, sy=B.y+(B.vy+ny*sg*pw)/P.aire;
+          return dentro(sx,sy,mg)?{sg,dur}:null;                          // el borde manda sobre la esquiva
+        };
+        const pref=Math.abs(cross)>8?Math.sign(cross):((nx*B.x+ny*B.y)>0?-1:1);   // hacia el lado en que ya está; si está centrada, hacia el centro
+        const e=lado(pref)||lado(-pref);
+        if(e){
+          lanzar(B,nx*e.sg*100,ny*e.sg*100,e.dur); rd.tL=rd.t; rd.esq=true;
+          bot.esqCd=1.2; bot.st='wait'; bot.t=Math.max(bot.t,.7);          // un disparo gastado: tiene que recargar
+        }
+      }
+    }
+  }
+  if(!amenaza) bot.evD=null;
+}
+
+function paso(){
+  for(const p of inp) if(p.on) p.t+=DT;
+  if(modo==='solo'){botPaso();botReflejos();}
+  if(msgT>0) msgT-=DT;
+  rd.t+=DT; rd.minM=Math.min(rd.minM,W.w/2-Math.abs(B.x),W.h/2-Math.abs(B.y));
+  const vmax=Math.max(Math.hypot(A.vx,A.vy),Math.hypot(B.vx,B.vy));
+  const n=clamp(Math.ceil(vmax*DT/(R*0.5)),1,200), h=DT/n, k=Math.exp(-P.aire*h);
+  for(let i=0;i<n;i++){
+    for(const d of D){d.x+=d.vx*h;d.y+=d.vy*h;d.vx*=k;d.vy*=k;}
+    colisionar(A,B);
+  }
+  for(const d of D) if(Math.hypot(d.vx,d.vy)<4){d.vx=d.vy=0;}
+  const fa=fuera(A), fb=fuera(B), s=modo==='solo';
+  if(fa||fb){
+    if(fa&&!fb){score.b++;msg=s?'Te has salido':'Azul fuera';}
+    else if(fb&&!fa){score.a++;msg=s?'Rival fuera':'Naranja fuera';}
+    else msg='Empate: los dos fuera';
+    if(s) aprender(fa,fb);
+    msgT=1.6; reiniciar();
+  }
+}
+
+/* ---------- Input (multitoque: en local, mitad izquierda = azul, derecha = naranja) ---------- */
+cv.addEventListener('pointerdown',e=>{
+  const r=cv.getBoundingClientRect(), i=modo==='solo'?0:(e.clientX-r.left<r.width/2?0:1);
+  if(inp[i].on) return;
+  cv.setPointerCapture(e.pointerId);
+  Object.assign(inp[i],{on:1,t:0,id:e.pointerId,sx:e.clientX,sy:e.clientY,cx:e.clientX,cy:e.clientY});
+});
+cv.addEventListener('pointermove',e=>{for(const p of inp) if(p.on&&p.id===e.pointerId){p.cx=e.clientX;p.cy=e.clientY;}});
+const fin=(e,l)=>inp.forEach((p,i)=>{if(p.on&&p.id===e.pointerId){p.on=0;if(l)lanzar(D[i],p.sx-p.cx,p.sy-p.cy,p.t);}});
+cv.addEventListener('pointerup',e=>fin(e,1));
+cv.addEventListener('pointercancel',e=>fin(e,0));
+
+/* ---------- Render ---------- */
+let C={},dpr=1,cw=1,ch=1,fr=0;
+function leerColores(){
+  const s=getComputedStyle(document.documentElement);
+  for(const k of ['bg','ice','grid','edge','p1','p2','tx','mut','line']) C[k]=s.getPropertyValue('--'+k).trim();
+}
+function ajustar(){
+  const r=cv.getBoundingClientRect(); dpr=window.devicePixelRatio||1;
+  cw=r.width; ch=r.height; cv.width=Math.round(cw*dpr); cv.height=Math.round(ch*dpr);
+}
+new ResizeObserver(ajustar).observe(cv);
+
+function disco(d){
+  ctx.beginPath(); ctx.arc(d.x,d.y,d.r,0,Math.PI*2);
+  ctx.fillStyle=C[d.col]; ctx.fill();
+  ctx.lineWidth=5; ctx.strokeStyle=C.tx; ctx.globalAlpha=.35; ctx.stroke(); ctx.globalAlpha=1;
+  ctx.beginPath(); ctx.arc(d.x,d.y,d.r*.55,0,Math.PI*2);
+  ctx.strokeStyle='rgba(255,255,255,.55)'; ctx.lineWidth=3; ctx.stroke();
+}
+
+function vista(v){
+  const d=v.d,o=v.o,c=d.cam,p=inp[D.indexOf(d)],sp=Math.hypot(d.vx,d.vy),zt=Math.min(v.w,ch)/700/(1+sp/2500);
+  c.x+=(d.x-c.x)*.12; c.y+=(d.y-c.y)*.12; c.z+=(zt-c.z)*.05;
+  const z=c.z;
+  ctx.save(); ctx.beginPath(); ctx.rect(v.x,0,v.w,ch); ctx.clip();
+  ctx.translate(v.x+v.w/2,ch/2); ctx.scale(z,z); ctx.translate(-c.x,-c.y);
+  ctx.fillStyle=C.ice; ctx.fillRect(-W.w/2,-W.h/2,W.w,W.h);
+  ctx.strokeStyle=C.grid; ctx.lineWidth=2/z; ctx.beginPath();
+  for(let x=-W.w/2;x<=W.w/2;x+=100){ctx.moveTo(x,-W.h/2);ctx.lineTo(x,W.h/2);}
+  for(let y=-W.h/2;y<=W.h/2;y+=100){ctx.moveTo(-W.w/2,y);ctx.lineTo(W.w/2,y);}
+  ctx.stroke();
+  ctx.strokeStyle=C.edge; ctx.lineWidth=8; ctx.strokeRect(-W.w/2,-W.h/2,W.w,W.h);
+  disco(o); disco(d);
+  if(p.on){
+    const dx=p.sx-p.cx, dy=p.sy-p.cy, L=Math.hypot(dx,dy);
+    if(L>=6){
+      const len=potencia(p.t)/4;
+      ctx.strokeStyle=C[d.col]; ctx.lineWidth=6; ctx.lineCap='round';
+      ctx.beginPath(); ctx.moveTo(d.x,d.y); ctx.lineTo(d.x+dx/L*len,d.y+dy/L*len); ctx.stroke();
+    }
+    ctx.beginPath(); ctx.arc(d.x,d.y,d.r+8+Math.min(p.t*14,60),0,Math.PI*2);
+    ctx.strokeStyle=C[d.col]; ctx.globalAlpha=.5; ctx.lineWidth=3; ctx.stroke(); ctx.globalAlpha=1;
+  }
+  ctx.restore();
+  // flecha hacia el rival cuando queda fuera de esta cámara
+  const rx=(o.x-c.x)*z+v.w/2, ry=(o.y-c.y)*z+ch/2, m=26;
+  if(rx<m||rx>v.w-m||ry<m||ry>ch-m){
+    const ang=Math.atan2(ry-ch/2,rx-v.w/2), px=v.x+clamp(rx,m,v.w-m), py=clamp(ry,m,ch-m);
+    ctx.save(); ctx.translate(px,py); ctx.rotate(ang);
+    ctx.fillStyle=C[o.col]; ctx.beginPath(); ctx.moveTo(14,0); ctx.lineTo(-10,-10); ctx.lineTo(-10,10); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+}
+
+function dibujar(){
+  if(fr++%30===0) leerColores();
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.fillStyle=C.bg; ctx.fillRect(0,0,cw,ch);
+  if(modo==='solo') vista({d:A,o:B,x:0,w:cw});
+  else{
+    vista({d:A,o:B,x:0,w:cw/2}); vista({d:B,o:A,x:cw/2,w:cw/2});
+    ctx.fillStyle=C.tx; ctx.fillRect(cw/2-1,0,2,ch);
+  }
+  if(msgT>0){
+    ctx.fillStyle=C.tx; ctx.font='600 28px system-ui,sans-serif'; ctx.textAlign='center';
+    ctx.fillText(msg,cw/2,ch/2-80);
+  }
+  const sp=Math.hypot(A.vx,A.vy), p=inp[0];
+  $('hud').innerHTML='<b>'+score.a+' – '+score.b+'</b> <span>'+(modo==='solo'?'tú · rival':'azul · naranja')+'</span>'+
+    (modo==='solo'?'<br><span>velocidad '+Math.round(sp)+' px/s'+(p.on?' · carga '+p.t.toFixed(1)+' s ('+Math.round(potencia(p.t))+' px/s)':'')+' · rival: '+mem.rounds+' rondas aprendidas</span>':'');
+}
+
+/* ---------- Ajustes ---------- */
+const defs=[
+  ['vBaja','Impacto suave (px/s)',50,600,10],
+  ['vAlta','Impacto fuerte (px/s)',400,2500,50],
+  ['aire','Fricción del aire',0.1,2,0.05],
+  ['carga','Fuerza de carga (px/s por s)',150,1200,10]
+];
+for(const [k,t,mn,mx,st] of defs){
+  const l=document.createElement('label');
+  l.innerHTML=t+'<output></output><input type="range" min="'+mn+'" max="'+mx+'" step="'+st+'" value="'+P[k]+'">';
+  const i=l.querySelector('input'), o=l.querySelector('output');
+  o.textContent=P[k];
+  i.addEventListener('input',()=>{P[k]=+i.value;o.textContent=i.value;});
+  $('ctl').appendChild(l);
+}
+$('lineal').addEventListener('change',e=>{P.lineal=e.target.checked;});
+$('bot').addEventListener('change',e=>{P.bot=e.target.checked;});
+$('ventaja').addEventListener('change',e=>{P.ventaja=e.target.checked;});
+$('reset').addEventListener('click',reiniciar);
+$('olvidar').addEventListener('click',()=>{mem=nuevo();mem.cand=mutar(mem.best);guardar();cerebro();});
+function ayuda(){
+  $('help').textContent=modo==='solo'
+    ?'Mantén pulsado y arrastra: el disco sale en sentido contrario. Cuanto más mantienes, más fuerza.'
+    :'Pantalla dividida: mitad izquierda = azul, derecha = naranja. Arrastra en tu mitad para cargar y soltar.';
+}
+$('modo').addEventListener('change',e=>{modo=e.target.value;score.a=score.b=0;reiniciar();ayuda();});
+
+/* ---------- Bucle: simulación a paso fijo, dibujo libre ---------- */
+let last=performance.now(),acc=0;
+function frame(now){
+  acc+=Math.min(.25,(now-last)/1000); last=now;
+  while(acc>=DT){paso();acc-=DT;}
+  dibujar(); requestAnimationFrame(frame);
+}
+ajustar(); leerColores(); ayuda(); cerebro(); initFB(); requestAnimationFrame(frame);
+</script>
+</body>
+</html>
